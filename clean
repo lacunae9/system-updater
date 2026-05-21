@@ -1,0 +1,328 @@
+#!/bin/bash
+
+exec 200>/tmp/clean.lock
+flock -n 200 || { echo "Another instance is already running."; exit 1; }
+
+[[ -t 1 ]] || { echo "Must run in a terminal."; exit 1; }
+
+sudo -v || exit 1
+( exec 200>&-; while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done ) &
+KEEPALIVE_PID=$!
+TASK_PID=""
+trap 'kill "$TASK_PID" 2>/dev/null; kill "$KEEPALIVE_PID" 2>/dev/null' EXIT INT TERM
+
+start_time=$(date +%s)
+disk_before=$(df --output=used / | tail -1)
+LOG=/tmp/clean-$(date +%Y%m%d-%H%M%S).log
+
+for cmd in cachyos-rate-mirrors fstrim paccache yay checkupdates systemctl \
+           pacdiff xargs ldd flatpak flock find timeout file; do
+    if ! command -v "$cmd" &> /dev/null; then
+        echo "Error: $cmd is required."
+        exit 1
+    fi
+done
+
+if ! command -v notify-send &> /dev/null; then
+    notify() { :; }
+else
+    notify() { notify-send "$@"; }
+fi
+
+GREEN='\e[32m'
+BLUE='\e[34m'
+CYAN='\e[36m'
+RED='\e[31m'
+YELLOW='\e[33m'
+RESET='\e[0m'
+
+tasks=(
+    $'12\tmirrors\ttimeout 120 sudo cachyos-rate-mirrors'
+    $'25\tfiles db\tsudo pacman -Fy'
+    $'38\tdisk cache\tsudo fstrim -av; sudo paccache -rk2 -q; sudo paccache -ruk0 -q; sudo rm -rf /var/cache/pacman/pkg/download-*'
+    $'50\taur cache\tyay -Sc --noconfirm'
+    $'63\tflatpak\tflatpak uninstall --unused -y; flatpak update -y'
+    $'75\ttrash\tfind ~/.local/share/Trash/files ~/.local/share/Trash/info -mindepth 1 -delete 2>/dev/null'
+    $'88\tyazi cache\trm -rf ~/.cache/yazi/'
+    $'100\tsystem logs\tsudo rm -rf /var/lib/systemd/coredump/*; sudo journalctl --vacuum-time=14d --flush --rotate'
+)
+
+ran_ok=()
+ran_fail=()
+skipped=()
+current_pct=0
+
+BAR_FULL='██████████████████████████████'
+BAR_EMPTY='                              '
+
+draw_bar() {
+    local width=30
+    local percent=$1
+    local label=$2
+    local filled_chars=$((percent * width / 100))
+    local fraction=$(( (percent * width % 100) * 8 / 100 ))
+    local f_bar="${BAR_FULL:0:filled_chars}"
+    local partial=""
+    if [ "$percent" -lt 100 ] && [ "$filled_chars" -lt "$width" ]; then
+        case $fraction in
+            1) partial="▏" ;; 2) partial="▎" ;; 3) partial="▍" ;; 4) partial="▌" ;;
+            5) partial="▋" ;; 6) partial="▊" ;; 7) partial="▉" ;; *) partial="" ;;
+        esac
+    fi
+    local empty_len=$((width - filled_chars))
+    [[ -n "$partial" ]] && ((empty_len--))
+    local e_bar="${BAR_EMPTY:0:empty_len}"
+    tput cuu1
+    tput el
+    printf "┏━ Clean [${CYAN}%s%s${RESET}%s] %3d%% - %s\n" "$f_bar" "$partial" "$e_bar" "$percent" "$label"
+}
+
+smooth_progress() {
+    local target=$1
+    local label=$2
+    while [ "$current_pct" -lt "$target" ]; do
+        ((current_pct++))
+        draw_bar "$current_pct" "$label"
+        sleep 0.005
+    done
+}
+
+run_with_activity() {
+    local command=$1 label=$2
+    echo "===== [$label] $(date '+%H:%M:%S') =====" >> "$LOG"
+    bash -c "$command" >> "$LOG" 2>&1 &
+    TASK_PID=$!
+    local spin='⣷⣯⣟⡿⢿⣻⣽⣾'
+    local i=0
+    while kill -0 "$TASK_PID" 2>/dev/null; do
+        draw_bar "$current_pct" "${spin:i%${#spin}:1} $label"
+        ((i++))
+        sleep 0.1
+    done
+    wait "$TASK_PID"
+    local rc=$?
+    TASK_PID=""
+    return $rc
+}
+
+confirm() {
+    local prompt=$1
+    local response
+    printf "┃ %s? (y/n) " "$prompt"
+    read -rsn 1 response
+    printf "\r\033[K"
+    [[ "$response" =~ ^[yY]$ ]]
+}
+
+printf "Pre-flight: checking updates... "
+updates=$(timeout 60 checkupdates 2>/dev/null)
+printf "done\n"
+
+printf "Pre-flight: finding orphans... "
+orphans=$(pacman -Qtdq 2>/dev/null)
+printf "done\n"
+
+check_broken_elf() {
+    local f="$1" out missing
+    [ -f "$f" ] || return 0
+    out=$(ldd "$f" 2>/dev/null) || return 0
+    missing=$(printf '%s\n' "$out" | awk '/not found/ {print $1}' | paste -sd,)
+    [ -n "$missing" ] && printf '%s\t%s\n' "$f" "$missing"
+    return 0
+}
+export -f check_broken_elf
+
+printf "Pre-flight: scanning AUR libraries... "
+broken_report=$(
+    pacman -Qm -q | xargs -r pacman -Ql 2>/dev/null | awk '{print $2}' | \
+        xargs -r file -F $'\x1f' --mime-type 2>/dev/null | \
+        awk -F'\x1f' '/x-sharedlib|x-executable|x-pie-executable/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1); print $1}' | \
+        xargs -r -P 8 -I {} bash -c 'check_broken_elf "$@"' _ {} | sort -u
+)
+printf "done\n\n"
+
+echo "┏━ Clean [                              ]   0% - ready"
+for entry in "${tasks[@]}"; do
+    IFS=$'\t' read -r target_pct label command <<< "$entry"
+
+    if confirm "$label"; then
+        if run_with_activity "$command" "$label"; then
+            ran_ok+=("$label")
+        else
+            ran_fail+=("$label")
+        fi
+        smooth_progress "$target_pct" "$label"
+    else
+        smooth_progress "$target_pct" "skipped $label"
+        skipped+=("$label")
+    fi
+done
+
+smooth_progress 100 "finished"
+
+echo "┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+for task in "${ran_ok[@]}";   do printf "┃  ${GREEN}+${RESET} %-43s ┃\n" "$task"; done
+for task in "${ran_fail[@]}"; do printf "┃  ${RED}!${RESET} %-43s ┃\n" "$task (failed)"; done
+for task in "${skipped[@]}";  do printf "┃  ${BLUE}-${RESET} %-43s ┃\n" "$task"; done
+echo "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+
+[[ ${#ran_fail[@]} -gt 0 ]] && echo -e "${YELLOW}Failure details: $LOG${RESET}"
+
+if [[ -n "$orphans" ]]; then
+    echo -e "\n${YELLOW}Orphan packages detected:${RESET}"
+    echo "$orphans" | sed 's/^/  /'
+    if confirm "Remove these orphans (pacman -Rns)"; then
+        printf '%s\n' "$orphans" | sudo pacman -Rns -
+    fi
+fi
+
+if [[ -n "$updates" ]]; then
+    echo -e "\nNew updates found:\n$updates"
+    yay -Syu
+fi
+
+if [[ -n "$broken_report" ]]; then
+    echo -e "\n${RED}! Broken AUR library links detected:${RESET}"
+
+    grouped=$(
+        while IFS=$'\t' read -r path missing; do
+            pkg=$(pacman -Qoq "$path" 2>/dev/null)
+            [ -n "$pkg" ] && printf '%s\t%s\t%s\n' "$pkg" "$path" "$missing"
+        done <<< "$broken_report" | sort
+    )
+
+    current_pkg=""
+    while IFS=$'\t' read -r pkg path missing; do
+        if [ "$pkg" != "$current_pkg" ]; then
+            echo -e "\n  ${YELLOW}${pkg}${RESET}"
+            current_pkg="$pkg"
+        fi
+        printf '    %s\n      missing: %s\n' "$path" "$missing"
+    done <<< "$grouped"
+
+    unique_sonames=$(printf '%s\n' "$broken_report" | cut -f2 | tr ',' '\n' | sort -u)
+    hints=""
+    while read -r soname; do
+        [ -z "$soname" ] && continue
+        providers=$(pacman -Fq "$soname" 2>/dev/null | sort -u | paste -sd,)
+        [ -n "$providers" ] && hints+="    $soname → $providers"$'\n'
+    done <<< "$unique_sonames"
+
+    if [[ -n "$hints" ]]; then
+        echo -e "\n  Likely providers (install to resolve):"
+        printf '%s' "$hints"
+    else
+        echo -e "\n  (Run 'sudo pacman -Fy' to enable provider hints.)"
+    fi
+
+    echo -e "\n  ${YELLOW}Note:${RESET} rebuild only fixes soname bumps where the AUR"
+    echo    "  package was built against an older system lib. For missing optional"
+    echo    "  deps (firewire, 32-bit backends, etc.), install the provider(s) above"
+    echo    "  instead — rebuild won't help."
+
+    notify "System" "Broken AUR links detected"
+
+    mapfile -t all_affected < <(printf '%s\n' "$grouped" | cut -f1 | sort -u)
+
+    rebuildable=()
+    prebuilt=()
+    not_in_aur=()
+
+    for pkg in "${all_affected[@]}"; do
+        if [[ "$pkg" == *-bin ]]; then
+            prebuilt+=("$pkg")
+        elif yay -Sia "$pkg" &>/dev/null; then
+            rebuildable+=("$pkg")
+        else
+            not_in_aur+=("$pkg")
+        fi
+    done
+
+    if [ "${#prebuilt[@]}" -gt 0 ] || [ "${#not_in_aur[@]}" -gt 0 ]; then
+        echo -e "\n  Cannot rebuild:"
+        for p in "${prebuilt[@]}"; do
+            echo "    $p (prebuilt binary — rebuild re-downloads identical tarball)"
+        done
+        for p in "${not_in_aur[@]}"; do
+            echo "    $p (not in AUR — install provider(s) above instead)"
+        done
+    fi
+
+    if [ "${#rebuildable[@]}" -gt 0 ]; then
+        echo -e "\n  Rebuildable:"
+        for p in "${rebuildable[@]}"; do
+            echo "    $p"
+        done
+        if confirm "Rebuild these AUR packages"; then
+            yay -S --rebuild "${rebuildable[@]/#/aur/}"
+        fi
+    fi
+fi
+
+pacnew_configs=$(sudo find /etc -name "*.pacnew" 2>/dev/null)
+if [[ -n "$pacnew_configs" ]]; then
+    echo -e "\n! Action required: .pacnew files found"
+    echo "$pacnew_configs" | sed 's/^/  /'
+    notify "System" "Configuration changes detected"
+    if confirm "Run pacdiff now"; then
+        sudo pacdiff
+    fi
+fi
+
+pacsave_configs=$(sudo find /etc -name "*.pacsave" 2>/dev/null)
+if [[ -n "$pacsave_configs" ]]; then
+    echo -e "\n${YELLOW}! Stale .pacsave files:${RESET}"
+    echo "$pacsave_configs" | sed 's/^/  /'
+fi
+
+failed_services=$(systemctl --failed --no-pager --no-legend 2>/dev/null)
+failed_user=$(systemctl --user --failed --no-pager --no-legend 2>/dev/null)
+if [[ -n "$failed_services" || -n "$failed_user" ]]; then
+    echo -e "\n${RED}! Failed systemd services:${RESET}"
+    [[ -n "$failed_services" ]] && echo "$failed_services" | sed 's/^/  /'
+    [[ -n "$failed_user" ]] && echo "$failed_user" | sed 's/^/  [user] /'
+
+    while read -r unit _rest; do
+        [[ -z "$unit" ]] && continue
+        unit="${unit#● }"
+
+        exit_status=$(systemctl --user show "$unit" -p ExecMainStatus --value 2>/dev/null)
+        [[ "$exit_status" == "139" ]] || continue
+
+        bin=$(systemctl --user show "$unit" -p ExecStart --value 2>/dev/null | awk '{print $1}')
+        bin=$(command -v "$(basename "$bin")" 2>/dev/null || echo "$bin")
+        [[ -x "$bin" ]] || continue
+
+        echo -e "\n  ${YELLOW}$unit crashed with SIGSEGV — checking dependencies...${RESET}"
+
+        suspects=()
+        while read -r lib; do
+            [[ -z "$lib" ]] && continue
+            pkg=$(pacman -Qoq "$lib" 2>/dev/null) || continue
+            if grep -q "upgraded $pkg " /var/log/pacman.log 2>/dev/null; then
+                last_upgrade=$(grep "upgraded $pkg " /var/log/pacman.log | tail -1)
+                suspects+=("$pkg ($last_upgrade)")
+            fi
+        done < <(ldd "$bin" 2>/dev/null | awk '/=>/ {print $3}')
+
+        if [[ ${#suspects[@]} -gt 0 ]]; then
+            echo "  Recently upgraded dependencies:"
+            printf '    %s\n' "${suspects[@]}"
+            echo ""
+            if confirm "Downgrade a suspect package"; then
+                printf "  Enter package name: "
+                read -r pkg_name
+                [[ -n "$pkg_name" ]] && sudo downgrade "$pkg_name"
+            fi
+        fi
+    done <<< "$failed_user"
+fi
+
+duration=$(($(date +%s) - start_time))
+disk_after=$(df --output=used / | tail -1)
+reclaimed=$(( (disk_before - disk_after) / 1024 ))
+if [[ $reclaimed -gt 0 ]]; then
+    echo -e "\ndone in ${duration}s — reclaimed ${reclaimed}MB"
+else
+    echo -e "\ndone in ${duration}s"
+fi
