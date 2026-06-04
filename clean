@@ -1,4 +1,5 @@
 #!/bin/bash
+set -uo pipefail
 
 exec 200>/tmp/clean.lock
 flock -n 200 || { echo "Another instance is already running."; exit 1; }
@@ -6,13 +7,13 @@ flock -n 200 || { echo "Another instance is already running."; exit 1; }
 [[ -t 1 ]] || { echo "Must run in a terminal."; exit 1; }
 
 sudo -v || exit 1
-( exec 200>&-; while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done ) &
+( exec 200>&-; while true; do sudo -n true; sleep 30; kill -0 "$$" 2>/dev/null || exit; done ) &
 KEEPALIVE_PID=$!
 TASK_PID=""
 trap 'kill "$TASK_PID" 2>/dev/null; kill "$KEEPALIVE_PID" 2>/dev/null' EXIT INT TERM
 
 start_time=$(date +%s)
-disk_before=$(df --output=used / | tail -1)
+disk_before=$(df --output=used / | awk 'NR==2{print $1}')
 LOG=/tmp/clean-$(date +%Y%m%d-%H%M%S).log
 
 for cmd in cachyos-rate-mirrors fstrim paccache yay checkupdates systemctl \
@@ -37,14 +38,14 @@ YELLOW='\e[33m'
 RESET='\e[0m'
 
 tasks=(
-    $'12\tmirrors\ttimeout 120 sudo cachyos-rate-mirrors'
-    $'25\tfiles db\tsudo pacman -Fy'
-    $'38\tdisk cache\tsudo fstrim -av; sudo paccache -rk2 -q; sudo paccache -ruk0 -q; sudo rm -rf /var/cache/pacman/pkg/download-*'
-    $'50\taur cache\tyay -Sc --noconfirm'
-    $'63\tflatpak\tflatpak uninstall --unused -y; flatpak update -y'
-    $'75\ttrash\tfind ~/.local/share/Trash/files ~/.local/share/Trash/info -mindepth 1 -delete 2>/dev/null'
-    $'88\tyazi cache\trm -rf ~/.cache/yazi/'
-    $'100\tsystem logs\tsudo rm -rf /var/lib/systemd/coredump/*; sudo journalctl --vacuum-time=14d --flush --rotate'
+    $'mirrors\ttimeout 120 sudo cachyos-rate-mirrors'
+    $'files db\tsudo pacman -Fy'
+    $'disk cache\tsudo fstrim -av; sudo paccache -rk2 -q; sudo paccache -ruk0 -q; sudo rm -rf /var/cache/pacman/pkg/download-*'
+    $'aur cache\tyay -Sc --noconfirm'
+    $'flatpak\tflatpak uninstall --unused -y; flatpak update -y'
+    $'trash\tfind ~/.local/share/Trash/files ~/.local/share/Trash/info -mindepth 1 -delete 2>/dev/null'
+    $'yazi cache\trm -rf ~/.cache/yazi/'
+    $'system logs\tsudo rm -rf /var/lib/systemd/coredump/*; sudo journalctl --vacuum-time=14d --flush --rotate'
 )
 
 ran_ok=()
@@ -114,6 +115,51 @@ confirm() {
     [[ "$response" =~ ^[yY]$ ]]
 }
 
+diagnose_segfaults() {
+    local flag=$1 list=$2
+    local unit _rest exit_status bin lib pkg last_upgrade pkg_name
+    while read -r unit _rest; do
+        [[ -z "$unit" ]] && continue
+        unit="${unit#● }"
+
+        exit_status=$(systemctl $flag show "$unit" -p ExecMainStatus --value 2>/dev/null)
+        [[ "$exit_status" == "139" ]] || continue
+
+        bin=$(systemctl $flag show "$unit" -p ExecStart --value 2>/dev/null | awk '{print $1}')
+        bin=$(command -v "$(basename "$bin")" 2>/dev/null || echo "$bin")
+        [[ -x "$bin" ]] || continue
+
+        echo -e "\n  ${YELLOW}$unit crashed with SIGSEGV — checking dependencies...${RESET}"
+
+        local suspects=()
+        while read -r lib; do
+            [[ -z "$lib" ]] && continue
+            pkg=$(pacman -Qoq "$lib" 2>/dev/null) || continue
+            if grep -q "upgraded $pkg " /var/log/pacman.log 2>/dev/null; then
+                last_upgrade=$(grep "upgraded $pkg " /var/log/pacman.log | tail -1)
+                suspects+=("$pkg ($last_upgrade)")
+            fi
+        done < <(ldd "$bin" 2>/dev/null | awk '/=>/ {print $3}')
+
+        if [[ ${#suspects[@]} -gt 0 ]]; then
+            echo "  Recently upgraded dependencies:"
+            printf '    %s\n' "${suspects[@]}"
+            echo ""
+            if confirm "Downgrade a suspect package"; then
+                printf "  Enter package name: "
+                read -r pkg_name
+                if [[ -n "$pkg_name" ]]; then
+                    if command -v downgrade >/dev/null; then
+                        sudo downgrade "$pkg_name"
+                    else
+                        echo "  downgrade is not installed (pacman -S downgrade)"
+                    fi
+                fi
+            fi
+        fi
+    done <<< "$list"
+}
+
 printf "Pre-flight: checking updates... "
 updates=$(timeout 60 checkupdates 2>/dev/null)
 printf "done\n"
@@ -141,9 +187,14 @@ broken_report=$(
 )
 printf "done\n\n"
 
+total=${#tasks[@]}
+idx=0
+
 echo "┏━ Clean [                              ]   0% - ready"
 for entry in "${tasks[@]}"; do
-    IFS=$'\t' read -r target_pct label command <<< "$entry"
+    IFS=$'\t' read -r label command <<< "$entry"
+    idx=$((idx + 1))
+    target_pct=$(( idx * 100 / total ))
 
     if confirm "$label"; then
         if run_with_activity "$command" "$label"; then
@@ -161,9 +212,9 @@ done
 smooth_progress 100 "finished"
 
 echo "┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
-for task in "${ran_ok[@]}";   do printf "┃  ${GREEN}+${RESET} %-43s ┃\n" "$task"; done
-for task in "${ran_fail[@]}"; do printf "┃  ${RED}!${RESET} %-43s ┃\n" "$task (failed)"; done
-for task in "${skipped[@]}";  do printf "┃  ${BLUE}-${RESET} %-43s ┃\n" "$task"; done
+for task in "${ran_ok[@]}";   do printf "┃  ${GREEN}+${RESET} %-43s ┃\n" "${task:0:43}"; done
+for task in "${ran_fail[@]}"; do s="${task} (failed)"; printf "┃  ${RED}!${RESET} %-43s ┃\n" "${s:0:43}"; done
+for task in "${skipped[@]}";  do printf "┃  ${BLUE}-${RESET} %-43s ┃\n" "${task:0:43}"; done
 echo "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
 
 [[ ${#ran_fail[@]} -gt 0 ]] && echo -e "${YELLOW}Failure details: $LOG${RESET}"
@@ -282,44 +333,12 @@ if [[ -n "$failed_services" || -n "$failed_user" ]]; then
     [[ -n "$failed_services" ]] && echo "$failed_services" | sed 's/^/  /'
     [[ -n "$failed_user" ]] && echo "$failed_user" | sed 's/^/  [user] /'
 
-    while read -r unit _rest; do
-        [[ -z "$unit" ]] && continue
-        unit="${unit#● }"
-
-        exit_status=$(systemctl --user show "$unit" -p ExecMainStatus --value 2>/dev/null)
-        [[ "$exit_status" == "139" ]] || continue
-
-        bin=$(systemctl --user show "$unit" -p ExecStart --value 2>/dev/null | awk '{print $1}')
-        bin=$(command -v "$(basename "$bin")" 2>/dev/null || echo "$bin")
-        [[ -x "$bin" ]] || continue
-
-        echo -e "\n  ${YELLOW}$unit crashed with SIGSEGV — checking dependencies...${RESET}"
-
-        suspects=()
-        while read -r lib; do
-            [[ -z "$lib" ]] && continue
-            pkg=$(pacman -Qoq "$lib" 2>/dev/null) || continue
-            if grep -q "upgraded $pkg " /var/log/pacman.log 2>/dev/null; then
-                last_upgrade=$(grep "upgraded $pkg " /var/log/pacman.log | tail -1)
-                suspects+=("$pkg ($last_upgrade)")
-            fi
-        done < <(ldd "$bin" 2>/dev/null | awk '/=>/ {print $3}')
-
-        if [[ ${#suspects[@]} -gt 0 ]]; then
-            echo "  Recently upgraded dependencies:"
-            printf '    %s\n' "${suspects[@]}"
-            echo ""
-            if confirm "Downgrade a suspect package"; then
-                printf "  Enter package name: "
-                read -r pkg_name
-                [[ -n "$pkg_name" ]] && sudo downgrade "$pkg_name"
-            fi
-        fi
-    done <<< "$failed_user"
+    [[ -n "$failed_user" ]]     && diagnose_segfaults "--user" "$failed_user"
+    [[ -n "$failed_services" ]] && diagnose_segfaults "" "$failed_services"
 fi
 
 duration=$(($(date +%s) - start_time))
-disk_after=$(df --output=used / | tail -1)
+disk_after=$(df --output=used / | awk 'NR==2{print $1}')
 reclaimed=$(( (disk_before - disk_after) / 1024 ))
 if [[ $reclaimed -gt 0 ]]; then
     echo -e "\ndone in ${duration}s — reclaimed ${reclaimed}MB"
